@@ -1,8 +1,8 @@
 """
 <plugin key="Marstek_modbus"
         name="Marstek Venus Modbus"
-        author="SilentSimon"
-        version="1.2">
+        author="Simon Riemersma"
+        version="1.3.0">
 
     <params>
         <param field="Address" label="Gateway IP Address" width="200px" required="true"/>
@@ -14,12 +14,7 @@
 """
 
 import Domoticz
-import pymodbus
-
-try:
-    from pymodbus.client import ModbusTcpClient
-except ImportError:
-    from pymodbus.client.sync import ModbusTcpClient
+from pymodbus.client import ModbusTcpClient
 
 MODE_NAMES = {0:"Manual",1:"Anti-feed",2:"Trade"}
 MODE_LEVELS = {0:0,1:10,2:20}
@@ -29,6 +24,7 @@ class BasePlugin:
 
     def __init__(self):
         self.counter = 0
+        self.register_profile = None
 
     def onStart(self):
 
@@ -76,62 +72,64 @@ class BasePlugin:
             elif typ == "Custom":
                 Domoticz.Device(Name=name,Unit=unit,Type=243,Subtype=31).Create()
             elif typ == "kWh":
-                Domoticz.Device(Name=name,Unit=unit,Type=113,Subtype=0).Create()
+                Domoticz.Device(Name=name,Unit=unit,Type=243,Subtype=31,
+                                Options={"Custom":"kWh"}).Create()
             elif typ == "Percentage":
                 Domoticz.Device(Name=name,Unit=unit,TypeName="Percentage").Create()
             else:
                 Domoticz.Device(Name=name,Unit=unit,TypeName=typ).Create()
 
-        try:
-            Domoticz.Log("Marstek Modbus: pymodbus {}".format(pymodbus.__version__))
-        except Exception:
-            Domoticz.Log("Marstek Modbus: pymodbus version unknown")
-
-        try:
-            self._read_holding(self.client(),0,1)
-            api="new"
-        except Exception:
-            api="legacy"
-
-        Domoticz.Log("Marstek Modbus: compatibility layer enabled")
-        Domoticz.Log("Marstek Modbus: Gateway {}:{} Slave {} Poll {}s".format(Parameters["Address"],Parameters["Port"],Parameters["Mode1"],Parameters["Mode6"]))
         Domoticz.Heartbeat(10)
 
     def client(self):
         return ModbusTcpClient(Parameters["Address"], port=int(Parameters["Port"]))
 
-    def _read_holding(self,c,address,count):
-        slave=int(Parameters["Mode1"])
-        try:
-            rr=c.read_holding_registers(address=address,count=count,device_id=slave)
-        except (TypeError, AttributeError):
-            rr=c.read_holding_registers(address,count,unit=slave)
-
-        if rr is None:
-            raise Exception(f"No response for register {address}")
-        if hasattr(rr,"isError") and rr.isError():
-            raise Exception(f"Modbus error reading register {address}: {rr}")
-        if not hasattr(rr,"registers"):
-            raise Exception(f"Invalid Modbus response for register {address}: {type(rr).__name__}")
-        return rr
-
-    def _write_register(self,c,address,value):
-        slave=int(Parameters["Mode1"])
-        try:
-            return c.write_register(address=address,value=value,device_id=slave)
-        except (TypeError, AttributeError):
-            return c.write_register(address,value,unit=slave)
-
     def read_u16(self,c,r):
-        return self._read_holding(c,r,1).registers[0]
+        return c.read_holding_registers(address=r,count=1,device_id=int(Parameters["Mode1"])).registers[0]
 
     def read_s16(self,c,r):
         v=self.read_u16(c,r)
         return v-65536 if v>32767 else v
 
     def read_u32(self,c,r):
-        rr=self._read_holding(c,r,2)
+        rr=c.read_holding_registers(address=r,count=2,device_id=int(Parameters["Mode1"]))
         return (rr.registers[0] << 16) | rr.registers[1]
+
+    def _detect_register_profile(self,c):
+        # V3-style: SOC 34002 in 0.1%; Venus E V2: SOC 32104 in whole %.
+        try:
+            raw=self.read_u16(c,34002)
+            if 0 <= raw <= 1000:
+                self.register_profile={"name":"V3-style","soc_register":34002,
+                                       "soc_scale":0.1,"cycle_register":34003}
+                Domoticz.Log("Marstek Modbus: detected V3-style map (SOC 34002 x0.1)")
+                return
+        except Exception as e:
+            Domoticz.Log("Marstek Modbus: 34002 unavailable; trying V2 SOC 32104. {}".format(e))
+
+        raw=self.read_u16(c,32104)
+        if not 0 <= raw <= 100:
+            raise Exception("Register-map detection failed: 32104 returned {}".format(raw))
+        self.register_profile={"name":"Venus E V2","soc_register":32104,
+                               "soc_scale":1.0,"cycle_register":None}
+        Domoticz.Log("Marstek Modbus: detected Venus E V2 map (SOC 32104 x1.0)")
+
+    def _ensure_register_profile(self,c):
+        if self.register_profile is None:
+            self._detect_register_profile(c)
+        return self.register_profile
+
+    def _read_cycle_count(self,c):
+        p=self._ensure_register_profile(c)
+        reg=p.get("cycle_register")
+        if reg is None:
+            return None
+        try:
+            return self.read_u16(c,reg)
+        except Exception as e:
+            Domoticz.Log("Marstek Modbus: Cycle Count unavailable: {}".format(e))
+            p["cycle_register"]=None
+            return None
 
     def onCommand(self, Unit, Command, Level, Hue):
         if Unit != 8:
@@ -140,7 +138,8 @@ class BasePlugin:
         if not c.connect():
             return
         try:
-            self._write_register(c,43000,LEVEL_TO_MODE.get(Level,0))
+            c.write_register(address=43000,value=LEVEL_TO_MODE.get(Level,0),
+                             device_id=int(Parameters["Mode1"]))
         finally:
             c.close()
 
@@ -158,9 +157,10 @@ class BasePlugin:
 
         try:
             Devices[11].Update(0,"Connected")
-            self.read_u16(c,30000)
 
-            soc=self.read_u16(c,34002)/10.0
+            profile=self._ensure_register_profile(c)
+            Devices[11].Update(0,"Connected ({})".format(profile["name"]))
+            soc=self.read_u16(c,profile["soc_register"])*profile["soc_scale"]
             capacity=self.read_u16(c,32105)*0.001
             remaining=capacity*soc/100.0
 
@@ -176,7 +176,7 @@ class BasePlugin:
             ac_power=self.read_s16(c,30006)
 
             rs485=self.read_u16(c,42000)
-            cycle_count=self.read_u16(c,34003)
+            cycle_count=self._read_cycle_count(c)
 
             max_cell=self.read_u16(c,37007)/1000.0
             min_cell=self.read_u16(c,37008)/1000.0
@@ -199,19 +199,20 @@ class BasePlugin:
             soh=100.0
 
             Devices[1].Update(0,str(round(soc,1)))
-            remaining_wh = int(round(remaining * 1000))
-            Devices[2].Update(remaining_wh, str(remaining_wh))
+            Devices[2].Update(0,str(round(remaining,3)))
             Devices[3].Update(0,str(round(voltage,2)))
             Devices[4].Update(0,str(round(current,1)))
             Devices[5].Update(0,str(battery_power))
             Devices[6].Update(0,str(round(temp,1)))
             Devices[7].Update(0,MODE_NAMES.get(mode,str(mode)))
             Devices[8].Update(nValue=1,sValue=str(MODE_LEVELS.get(mode,0)))
-            capacity_wh = int(round(capacity * 1000))
-            Devices[9].Update(capacity_wh, str(capacity_wh))
+            Devices[9].Update(0,str(round(capacity,3)))
             Devices[10].Update(0,str(ac_power))
             Devices[12].Update(0,rs485_status)
-            Devices[13].Update(0,str(cycle_count))
+            if cycle_count is not None:
+                Devices[13].Update(0,str(cycle_count))
+            elif Devices[13].sValue != "N/A":
+                Devices[13].Update(0,"N/A")
             Devices[14].Update(0,str(eff))
             Devices[15].Update(0,direction)
             Devices[16].Update(0,str(soh))
@@ -220,13 +221,10 @@ class BasePlugin:
             Devices[19].Update(0,str(round(mos2,1)))
             Devices[20].Update(0,str(round(max_cell,3)))
             Devices[21].Update(0,str(round(min_cell,3)))
-            daily_charge_wh = int(round(daily_charge * 1000))
-            daily_discharge_wh = int(round(daily_discharge * 1000))
-            Devices[22].Update(daily_charge_wh, str(daily_charge_wh))
-            Devices[23].Update(daily_discharge_wh, str(daily_discharge_wh))
+            Devices[22].Update(0,str(round(daily_charge,2)))
+            Devices[23].Update(0,str(round(daily_discharge,2)))
         except Exception as e:
             Domoticz.Error("Marstek Modbus: {}".format(e))
-            Domoticz.Error("Marstek Modbus: Verify Slave ID, baud rate (115200), RS485 A/B wiring and DR134 Modbus Simple Protocol Conversion mode.")
         finally:
             c.close()
 
