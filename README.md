@@ -29,6 +29,35 @@ I guess any DR134 device that simply converts modbus RTU data > TCP protocol dat
 
 
 ----
+Changelog 1.3:
+- TCP connection failure is now distinguished from an RS485/Modbus failure.
+  - If TCP connects but register 30000 gets no response / 0 bytes, the Connection Status becomes: Gateway connected / No Modbus reply
+- Modbus Exception 02 / Illegal Data Address is identified separately. This tells us communication works, but that particular register isn't supported by the battery model/firmware.
+- Error messages now distinguish:
+  - Gateway/network unreachable
+  - Gateway reachable but battery/RS485 not replying
+  - Unsupported register
+  - Other Modbus errors
+- Troubleshooting for a no-response condition now specifically mentions:
+  - Slave ID
+  - 115200 8N1
+  - RS485 A/B
+  - Correct battery RS485 port
+  - Gateway TCP-to-RTU conversion mode
+  - Other/concurrent Modbus clients
+- Automatic register-map detection
+  -Tries 34002 first for the existing V3-style map.
+  - If unsupported/Illegal Data Address, automatically tries 32104.
+- Correct SOC scaling
+  - V3-style: 34002, raw × 0.1
+  - Venus E V2: 32104, raw × 1.0
+- Cycle Count handled gracefully
+  - V3-style attempts 34003.
+  - V2 does not attempt the known-invalid 34003; Cycle Count displays N/A
+
+
+
+
 Changelog 1.2:
 - Improved _read_holding():
   - Detects no response.
