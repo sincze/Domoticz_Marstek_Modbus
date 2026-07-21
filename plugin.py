@@ -2,7 +2,7 @@
 <plugin key="Marstek_modbus"
         name="Marstek Venus Modbus"
         author="Simon Riemersma"
-        version="1.3.0">
+        version="1.3.1">
 
     <params>
         <param field="Address" label="Gateway IP Address" width="200px" required="true"/>
@@ -95,24 +95,41 @@ class BasePlugin:
         rr=c.read_holding_registers(address=r,count=2,device_id=int(Parameters["Mode1"]))
         return (rr.registers[0] << 16) | rr.registers[1]
 
+    def _is_illegal_address_error(self,e):
+        t=str(e).lower()
+        return ("exception_code=2" in t or "code=2" in t or
+                "illegal data address" in t)
+
     def _detect_register_profile(self,c):
-        # V3-style: SOC 34002 in 0.1%; Venus E V2: SOC 32104 in whole %.
+        # Only fall back to V2 after an explicit Illegal Data Address (02).
+        # A timeout/ModbusIOException is a communication fault, not model detection.
         try:
             raw=self.read_u16(c,34002)
-            if 0 <= raw <= 1000:
-                self.register_profile={"name":"V3-style","soc_register":34002,
-                                       "soc_scale":0.1,"cycle_register":34003}
-                Domoticz.Log("Marstek Modbus: detected V3-style map (SOC 34002 x0.1)")
-                return
+            if not 0 <= raw <= 1000:
+                raise Exception("Implausible SOC raw value {} at 34002".format(raw))
+            self.register_profile={"name":"V3-style","soc_register":34002,
+                                   "soc_scale":0.1,"cycle_register":34003}
+            Domoticz.Log("Marstek Modbus: detected V3-style map (SOC 34002 x0.1)")
+            return
         except Exception as e:
-            Domoticz.Log("Marstek Modbus: 34002 unavailable; trying V2 SOC 32104. {}".format(e))
+            if not self._is_illegal_address_error(e):
+                raise Exception(
+                    "Register-map detection stopped: 34002 did not return a valid value "
+                    "or explicit Illegal Data Address (02). Treating this as a communication "
+                    "problem, not as Venus E V2. Details: {}".format(e))
+            Domoticz.Log("Marstek Modbus: 34002 returned Illegal Data Address (02); trying V2 SOC 32104.")
 
-        raw=self.read_u16(c,32104)
+        try:
+            raw=self.read_u16(c,32104)
+        except Exception as e:
+            raise Exception(
+                "Possible Venus E V2 (34002 returned exception 02), but 32104 did not "
+                "return a valid SOC response. Model not selected. Details: {}".format(e))
         if not 0 <= raw <= 100:
-            raise Exception("Register-map detection failed: 32104 returned {}".format(raw))
+            raise Exception("V2 SOC 32104 returned {}, expected 0..100".format(raw))
         self.register_profile={"name":"Venus E V2","soc_register":32104,
                                "soc_scale":1.0,"cycle_register":None}
-        Domoticz.Log("Marstek Modbus: detected Venus E V2 map (SOC 32104 x1.0)")
+        Domoticz.Log("Marstek Modbus: detected Venus E V2 map (SOC 32104 x1.0; cycle count unavailable)")
 
     def _ensure_register_profile(self,c):
         if self.register_profile is None:
