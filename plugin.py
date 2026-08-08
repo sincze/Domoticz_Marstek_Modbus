@@ -28,6 +28,15 @@ class BasePlugin:
 
     def onStart(self):
 
+        # One-time migration: units 22/23 were previously created as Custom Sensor
+        # (Type=243/Subtype=31), which Domoticz shows as plain text, not a real kWh
+        # meter. Recreate them as Subtype=29 ("kWh") so dashboards can use them as
+        # proper energy devices. This drops history for these two units only.
+        for unit in (22, 23):
+            if unit in Devices and Devices[unit].SubType != 29:
+                Domoticz.Log("Marstek Modbus: recreating Unit {} as kWh energy meter (was Custom Sensor)".format(unit))
+                Devices[unit].Delete()
+
         defs = [
             (1,"SOC","Percentage"),
             (2,"Remaining Energy","kWh"),
@@ -50,8 +59,8 @@ class BasePlugin:
             (19,"MOS2 Temperature","Temperature"),
             (20,"Max Cell Voltage","Voltage"),
             (21,"Min Cell Voltage","Voltage"),
-            (22,"Daily Charge Energy","kWh"),
-            (23,"Daily Discharge Energy","kWh"),
+            (22,"Daily Charge Energy","EnergyCounter"),
+            (23,"Daily Discharge Energy","EnergyCounter"),
         ]
 
         for unit,name,typ in defs:
@@ -74,6 +83,8 @@ class BasePlugin:
             elif typ == "kWh":
                 Domoticz.Device(Name=name,Unit=unit,Type=243,Subtype=31,
                                 Options={"Custom":"kWh"}).Create()
+            elif typ == "EnergyCounter":
+                Domoticz.Device(Name=name,Unit=unit,Type=243,Subtype=29).Create()
             elif typ == "Percentage":
                 Domoticz.Device(Name=name,Unit=unit,TypeName="Percentage").Create()
             else:
@@ -238,8 +249,9 @@ class BasePlugin:
             Devices[19].Update(0,str(round(mos2,1)))
             Devices[20].Update(0,str(round(max_cell,3)))
             Devices[21].Update(0,str(round(min_cell,3)))
-            Devices[22].Update(0,str(round(daily_charge,2)))
-            Devices[23].Update(0,str(round(daily_discharge,2)))
+            # Subtype 29 (kWh) needs "power;energy_Wh" - power unused here, set to 0
+            Devices[22].Update(nValue=0,sValue="0;{}".format(round(daily_charge*1000)))
+            Devices[23].Update(nValue=0,sValue="0;{}".format(round(daily_discharge*1000)))
         except Exception as e:
             Domoticz.Error("Marstek Modbus: {}".format(e))
         finally:
