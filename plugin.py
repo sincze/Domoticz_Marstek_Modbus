@@ -25,6 +25,14 @@ class BasePlugin:
     def __init__(self):
         self.counter = 0
         self.register_profile = None
+        # 33004/33006 are daily-reset counters on the Marstek side (no lifetime/
+        # cumulative register exists in this plugin's register map). Domoticz's
+        # kWh device type expects an ever-increasing total so it can compute
+        # "Today" itself, so we accumulate a running lifetime total in Wh here.
+        self.prev_daily_charge = None
+        self.prev_daily_discharge = None
+        self.total_charge_wh = None
+        self.total_discharge_wh = None
 
     def onStart(self):
 
@@ -90,7 +98,37 @@ class BasePlugin:
             else:
                 Domoticz.Device(Name=name,Unit=unit,TypeName=typ).Create()
 
+        # Seed the running lifetime totals from whatever Domoticz already has
+        # persisted for these devices (Domoticz keeps the last sValue across
+        # plugin restarts), so we don't reset the counter to 0 on every restart.
+        self.total_charge_wh = self._seed_total_wh(22)
+        self.total_discharge_wh = self._seed_total_wh(23)
+
         Domoticz.Heartbeat(10)
+
+    def _seed_total_wh(self,unit):
+        if unit in Devices:
+            try:
+                parts=Devices[unit].sValue.split(";")
+                if len(parts) == 2:
+                    return float(parts[1])
+            except Exception:
+                pass
+        return 0.0
+
+    def _accumulate_wh(self,new_daily_kwh,prev_daily_kwh,running_total_wh):
+        if prev_daily_kwh is None:
+            # First poll after a restart: don't know how much of new_daily_kwh
+            # is already reflected in the seeded running total, so contribute
+            # nothing this cycle and just establish the baseline.
+            delta_kwh=0.0
+        elif new_daily_kwh < prev_daily_kwh:
+            # Daily counter reset at midnight (or device reboot); the new,
+            # smaller value IS the delta accrued since the reset.
+            delta_kwh=new_daily_kwh
+        else:
+            delta_kwh=new_daily_kwh - prev_daily_kwh
+        return running_total_wh + delta_kwh*1000.0
 
     def client(self):
         return ModbusTcpClient(Parameters["Address"], port=int(Parameters["Port"]))
@@ -249,9 +287,18 @@ class BasePlugin:
             Devices[19].Update(0,str(round(mos2,1)))
             Devices[20].Update(0,str(round(max_cell,3)))
             Devices[21].Update(0,str(round(min_cell,3)))
-            # Subtype 29 (kWh) needs "power;energy_Wh" - power unused here, set to 0
-            Devices[22].Update(nValue=0,sValue="0;{}".format(round(daily_charge*1000)))
-            Devices[23].Update(nValue=0,sValue="0;{}".format(round(daily_discharge*1000)))
+            # Subtype 29 (kWh) needs "power;energy_Wh" where energy_Wh must be an
+            # ever-increasing lifetime total for Domoticz's own Today-diff to work.
+            # 33004/33006 are daily-reset registers, so accumulate a running total
+            # here instead of passing the raw daily value through. Power unused,
+            # set to 0.
+            self.total_charge_wh=self._accumulate_wh(daily_charge,self.prev_daily_charge,self.total_charge_wh)
+            self.prev_daily_charge=daily_charge
+            self.total_discharge_wh=self._accumulate_wh(daily_discharge,self.prev_daily_discharge,self.total_discharge_wh)
+            self.prev_daily_discharge=daily_discharge
+
+            Devices[22].Update(nValue=0,sValue="0;{}".format(round(self.total_charge_wh)))
+            Devices[23].Update(nValue=0,sValue="0;{}".format(round(self.total_discharge_wh)))
         except Exception as e:
             Domoticz.Error("Marstek Modbus: {}".format(e))
         finally:
