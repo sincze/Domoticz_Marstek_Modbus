@@ -290,15 +290,27 @@ class BasePlugin:
             # Subtype 29 (kWh) needs "power;energy_Wh" where energy_Wh must be an
             # ever-increasing lifetime total for Domoticz's own Today-diff to work.
             # 33004/33006 are daily-reset registers, so accumulate a running total
-            # here instead of passing the raw daily value through. Power unused,
-            # set to 0.
+            # here instead of passing the raw daily value through.
             self.total_charge_wh=self._accumulate_wh(daily_charge,self.prev_daily_charge,self.total_charge_wh)
             self.prev_daily_charge=daily_charge
             self.total_discharge_wh=self._accumulate_wh(daily_discharge,self.prev_daily_discharge,self.total_discharge_wh)
             self.prev_daily_discharge=daily_discharge
 
-            Devices[22].Update(nValue=0,sValue="0;{}".format(round(self.total_charge_wh)))
-            Devices[23].Update(nValue=0,sValue="0;{}".format(round(self.total_discharge_wh)))
+            # Live power for the power field: deliberately battery_power (30001),
+            # not ac_power (30006). battery_power already has an established,
+            # in-code-verified sign convention (used for `direction` above:
+            # >50 Charging, <-50 Discharging); ac_power's polarity relative to
+            # charge/discharge is undocumented here and only ever used as a
+            # magnitude (abs()) elsewhere, so it isn't safe to trust its sign.
+            # Gating on `direction` keeps charge/discharge mutually exclusive:
+            # only the tile matching the current state shows a nonzero Watt
+            # value, the other reports 0, matching a battery that can't charge
+            # and discharge at the same time.
+            charge_power=battery_power if direction == "Charging" else 0
+            discharge_power=abs(battery_power) if direction == "Discharging" else 0
+
+            Devices[22].Update(nValue=0,sValue="{};{}".format(charge_power,round(self.total_charge_wh)))
+            Devices[23].Update(nValue=0,sValue="{};{}".format(discharge_power,round(self.total_discharge_wh)))
         except Exception as e:
             Domoticz.Error("Marstek Modbus: {}".format(e))
         finally:
